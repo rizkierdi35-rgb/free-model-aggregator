@@ -70,6 +70,22 @@ let manifestIndex = 0;
 const usageCount = new Map<string, number>();
 /** Refusals each provider has given so far. */
 const failureCount = new Map<string, number>();
+/** 429 (rate-limit) refusals each provider has given so far. A provider that is
+ * rate-limited has spent its budget, so it is far more likely to refuse again
+ * than a provider that failed once for another reason. */
+const rateLimitCount = new Map<string, number>();
+/** Extra score penalty per 429, on top of the generic per-failure penalty. */
+const RATE_LIMIT_PENALTY = 75;
+
+/**
+ * A normalised answer is only usable when it actually carries text. An upstream
+ * that answers 200 with an empty body has not served the request at all: serving
+ * its empty text would waste the one answer the client gets, so it is treated
+ * as a refusal and the request fails over to the next candidate instead.
+ */
+function answerUsable(answer: NormalizedAnswer): boolean {
+  return answer.text.trim() !== '';
+}
 
 /** Soft per-provider call cap: the sealed budget ranges bottom out near these numbers. */
 const CALL_CAP: Record<string, number> = {
@@ -137,7 +153,7 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic')
     }
   }
   const scoreOf = (c: Candidate): number =>
-    c.rating - 25 * (failureCount.get(c.probe.provider.id) ?? 0) - ((usageCount.get(c.probe.provider.id) ?? 0) >= capOf(c.probe.provider.id) ? 300 : 0);
+    c.rating - 25 * (failureCount.get(c.probe.provider.id) ?? 0) - RATE_LIMIT_PENALTY * (rateLimitCount.get(c.probe.provider.id) ?? 0) - ((usageCount.get(c.probe.provider.id) ?? 0) >= capOf(c.probe.provider.id) ? 300 : 0);
   out.sort((a, b) =>
     scoreOf(b) - scoreOf(a) ||
     a.wireRank - b.wireRank ||
@@ -287,10 +303,16 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, requires: Re
     usageCount.set(providerId, (usageCount.get(providerId) ?? 0) + 1);
     const result = await callCandidate(cand, clientApi, body, stream, jsonMode);
     if (result.ok) {
+      if (!answerUsable(result.answer)) {
+        failureCount.set(providerId, (failureCount.get(providerId) ?? 0) + 1);
+        log(`empty answer from ${providerId}/${cand.model.id}: failing over to the next candidate`);
+        continue;
+      }
       const text = clientApi === 'openai' ? renderOpenAI(result.answer, cand.model.id, stream) : renderAnthropic(result.answer, cand.model.id, stream);
       return { status: 200, text, contentType: stream ? 'text/event-stream' : 'application/json' };
     }
     failureCount.set(providerId, (failureCount.get(providerId) ?? 0) + 1);
+    if (result.status === 429) rateLimitCount.set(providerId, (rateLimitCount.get(providerId) ?? 0) + 1);
     log(`request failed on ${providerId}/${cand.model.id}: HTTP ${result.status} ${result.code}`);
   }
   return null;
