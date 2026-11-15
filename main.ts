@@ -76,6 +76,13 @@ const failureCount = new Map<string, number>();
 const rateLimitCount = new Map<string, number>();
 /** Extra score penalty per 429, on top of the generic per-failure penalty. */
 const RATE_LIMIT_PENALTY = 75;
+/** Consecutive refusals per provider since its last success. After this many
+ * in a row the provider is treated as exhausted for the rest of the trial:
+ * its sealed budget is spent, so further calls to it would only burn the
+ * request's remaining candidates while the other providers wait. A success
+ * resets the count: one good answer proves the provider is alive again. */
+const consecutiveFailures = new Map<string, number>();
+const CIRCUIT_BREAKER_THRESHOLD = 3;
 
 /**
  * A normalised answer is only usable when it actually carries text. An upstream
@@ -144,6 +151,11 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic')
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
+    // Circuit breaker: a provider that has refused three times in a row since
+    // its last success is exhausted; do not spend calls on it. The breaker
+    // only narrows the candidate list — when every provider is open, nothing
+    // changes, and a provider that answers again is let back in by serve().
+    if ((consecutiveFailures.get(probe.provider.id) ?? 0) >= CIRCUIT_BREAKER_THRESHOLD) continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
@@ -305,13 +317,16 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, requires: Re
     if (result.ok) {
       if (!answerUsable(result.answer)) {
         failureCount.set(providerId, (failureCount.get(providerId) ?? 0) + 1);
+        consecutiveFailures.set(providerId, (consecutiveFailures.get(providerId) ?? 0) + 1);
         log(`empty answer from ${providerId}/${cand.model.id}: failing over to the next candidate`);
         continue;
       }
+      consecutiveFailures.set(providerId, 0);
       const text = clientApi === 'openai' ? renderOpenAI(result.answer, cand.model.id, stream) : renderAnthropic(result.answer, cand.model.id, stream);
       return { status: 200, text, contentType: stream ? 'text/event-stream' : 'application/json' };
     }
     failureCount.set(providerId, (failureCount.get(providerId) ?? 0) + 1);
+    consecutiveFailures.set(providerId, (consecutiveFailures.get(providerId) ?? 0) + 1);
     if (result.status === 429) rateLimitCount.set(providerId, (rateLimitCount.get(providerId) ?? 0) + 1);
     log(`request failed on ${providerId}/${cand.model.id}: HTTP ${result.status} ${result.code}`);
   }
